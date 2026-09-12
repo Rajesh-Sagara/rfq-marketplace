@@ -16,7 +16,6 @@ const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET;
 const DATABASE_URL = process.env.DATABASE_URL || process.env.DB_URL;
-const DB_SCHEMA_PATH = path.join(__dirname, 'db_schema.sql');
 
 if (!JWT_SECRET) {
   logger.error('Missing JWT_SECRET — set it in environment');
@@ -27,11 +26,61 @@ if (!DATABASE_URL) {
   process.exit(1);
 }
 
-const pool = new Pool({ connectionString: DATABASE_URL, max: 10 });
+// Configured Pool with SSL support for Render PostgreSQL
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  max: 10,
+  ssl: process.env.NODE_ENV === 'production' || process.env.DATABASE_URL.includes('render.com')
+    ? { rejectUnauthorized: false }
+    : false
+});
 
+// Automatic schema verification & creation on startup
+async function ensureSchema() {
+  const client = await pool.connect();
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        email TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('buyer', 'supplier')),
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+      );
 
+      CREATE TABLE IF NOT EXISTS rfqs (
+        id SERIAL PRIMARY KEY,
+        buyer_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        product_name TEXT NOT NULL,
+        description TEXT NOT NULL,
+        quantity INTEGER NOT NULL,
+        delivery_location TEXT NOT NULL,
+        deadline TIMESTAMP WITH TIME ZONE NOT NULL,
+        status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+      );
 
-// helpers
+      CREATE TABLE IF NOT EXISTS quotations (
+        id SERIAL PRIMARY KEY,
+        rfq_id INTEGER NOT NULL REFERENCES rfqs(id) ON DELETE CASCADE,
+        supplier_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        price NUMERIC NOT NULL,
+        delivery_time TEXT NOT NULL,
+        notes TEXT,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+        UNIQUE(rfq_id, supplier_id)
+      );
+    `);
+    logger.info("Database schema verified and successfully initialized.");
+  } catch (err) {
+    logger.error({ err }, "Database schema initialization failed.");
+  } finally {
+    client.release();
+  }
+}
+
+// App configuration & middleware
 const app = express();
 app.use(helmet({
   contentSecurityPolicy: {
@@ -46,7 +95,7 @@ app.use(helmet({
 }));
 app.use(express.json({ limit: '1mb' }));
 app.use(pinoHttp({ logger }));
-// attach a request id and expose it via header for tracing
+
 app.use((req, res, next) => {
   try { req.id = randomUUID(); } catch (e) { req.id = Math.random().toString(36).slice(2); }
   res.setHeader('X-Request-Id', req.id);
@@ -57,6 +106,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 200 });
 app.use(limiter);
 
+// Helpers
 function signToken(payload) {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: '1h' });
 }
@@ -73,10 +123,9 @@ async function getAuthUser(req) {
   return row.rows[0] || null;
 }
 
-// Validation schemas (zod)
-const signupSchema = z.object({ name: z.string().min(1), email: z.string().email(), password: z.string().min(6), role: z.enum(['buyer','supplier']) });
+// Validation schemas (Zod)
+const signupSchema = z.object({ name: z.string().min(1), email: z.string().email(), password: z.string().min(6), role: z.enum(['buyer', 'supplier']) });
 const loginSchema = z.object({ email: z.string().email(), password: z.string().min(1) });
-// RFQ and quotation schemas
 const rfqCreateSchema = z.object({
   product_name: z.string().min(1),
   description: z.string().min(1),
@@ -84,7 +133,7 @@ const rfqCreateSchema = z.object({
   delivery_location: z.string().min(1),
   deadline: z.string().refine((s) => !Number.isNaN(Date.parse(s)), { message: 'Invalid deadline' })
 });
-const rfqUpdateSchema = rfqCreateSchema.partial().extend({ status: z.enum(['open','closed']).optional() });
+const rfqUpdateSchema = rfqCreateSchema.partial().extend({ status: z.enum(['open', 'closed']).optional() });
 const quotationSchema = z.object({
   price: z.preprocess((v) => (typeof v === 'string' ? Number(v) : v), z.number().positive()),
   delivery_time: z.string().min(1),
@@ -105,9 +154,9 @@ app.post('/api/auth/signup', async (req, res) => {
     const token = signToken({ id: user.id });
     res.status(201).json({ token, user });
   } catch (err) {
-    if (err.name === 'ZodError') return res.status(400).json({ error: 'Validation failed', details: err.errors });
-    req.log.error(err);
-    res.status(500).json({ error: 'Internal server error' });
+    if (err instanceof z.ZodError || err.name === 'ZodError') return res.status(400).json({ error: 'Validation failed', details: err.errors });
+    req.log.error(err, "Signup error occurred");
+    res.status(500).json({ error: 'Internal server error', details: err.message });
   }
 });
 
@@ -122,19 +171,17 @@ app.post('/api/auth/login', async (req, res) => {
     const token = signToken({ id: user.id });
     res.json({ token, user: { id: user.id, name: user.name, email: user.email, role: user.role } });
   } catch (err) {
-    if (err.name === 'ZodError') return res.status(400).json({ error: 'Validation failed', details: err.errors });
-    req.log.error(err);
-    res.status(500).json({ error: 'Internal server error' });
+    if (err instanceof z.ZodError || err.name === 'ZodError') return res.status(400).json({ error: 'Validation failed', details: err.errors });
+    req.log.error(err, "Login error occurred");
+    res.status(500).json({ error: 'Internal server error', details: err.message });
   }
 });
 
-// Health and readiness
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 app.get('/ready', async (req, res) => {
   try { await pool.query('SELECT 1'); res.json({ ready: true }); } catch (err) { res.status(503).json({ ready: false }); }
 });
 
-// Simple RFQ endpoints: create and list (kept minimal)
 app.post('/api/rfqs', async (req, res) => {
   try {
     const user = await getAuthUser(req);
@@ -146,7 +193,7 @@ app.post('/api/rfqs', async (req, res) => {
       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`, [user.id, product_name.trim(), description.trim(), Number(quantity), delivery_location.trim(), deadline]);
     res.status(201).json(info.rows[0]);
   } catch (err) {
-    if (err && err.name === 'ZodError') return res.status(400).json({ error: 'Validation failed', details: err.errors });
+    if (err instanceof z.ZodError || err.name === 'ZodError') return res.status(400).json({ error: 'Validation failed', details: err.errors });
     req.log.error(err); res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -163,15 +210,14 @@ app.get('/api/rfqs', async (req, res) => {
     const location = (req.query.location || '').trim();
     let sql = `SELECT rfqs.*, users.name as buyer_name FROM rfqs JOIN users ON users.id = rfqs.buyer_id WHERE status = 'open'`;
     const params = [];
-    if (search) { params.push(`%${search}%`, `%${search}%`); sql += ` AND (product_name ILIKE $${params.length-1} OR description ILIKE $${params.length})`; }
+    if (search) { params.push(`%${search}%`, `%${search}%`); sql += ` AND (product_name ILIKE $${params.length - 1} OR description ILIKE $${params.length})`; }
     if (location) { params.push(`%${location}%`); sql += ` AND delivery_location ILIKE $${params.length}`; }
     sql += ' ORDER BY created_at DESC';
     const rows = await pool.query(sql, params);
     res.json(rows.rows);
-  } catch (err) { if (err && err.name === 'ZodError') return res.status(400).json({ error: 'Validation failed', details: err.errors }); req.log.error(err); res.status(500).json({ error: 'Internal server error' }); }
+  } catch (err) { if (err instanceof z.ZodError || err.name === 'ZodError') return res.status(400).json({ error: 'Validation failed', details: err.errors }); req.log.error(err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
-// Get single RFQ detail
 app.get('/api/rfqs/:id', async (req, res) => {
   try {
     const user = await getAuthUser(req);
@@ -185,7 +231,6 @@ app.get('/api/rfqs/:id', async (req, res) => {
   } catch (err) { req.log.error(err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
-// Edit RFQ (buyer owner only)
 app.put('/api/rfqs/:id', async (req, res) => {
   try {
     const user = await getAuthUser(req);
@@ -210,7 +255,6 @@ app.put('/api/rfqs/:id', async (req, res) => {
   } catch (err) { req.log.error(err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
-// Delete RFQ (buyer owner only)
 app.delete('/api/rfqs/:id', async (req, res) => {
   try {
     const user = await getAuthUser(req);
@@ -226,7 +270,6 @@ app.delete('/api/rfqs/:id', async (req, res) => {
   } catch (err) { req.log.error(err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
-// Submit quotation (supplier only)
 app.post('/api/rfqs/:id/quotations', async (req, res) => {
   try {
     const user = await getAuthUser(req);
@@ -249,7 +292,6 @@ app.post('/api/rfqs/:id/quotations', async (req, res) => {
   } catch (err) { req.log.error(err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
-// View quotations for an RFQ (buyer owner only)
 app.get('/api/rfqs/:id/quotations', async (req, res) => {
   try {
     const user = await getAuthUser(req);
@@ -266,7 +308,6 @@ app.get('/api/rfqs/:id/quotations', async (req, res) => {
   } catch (err) { req.log.error(err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
-// Supplier: view own submitted quotations
 app.get('/api/quotations/mine', async (req, res) => {
   try {
     const user = await getAuthUser(req);
@@ -279,16 +320,16 @@ app.get('/api/quotations/mine', async (req, res) => {
   } catch (err) { req.log.error(err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
-// Global error handler
 app.use((err, req, res, next) => {
   req.log.error(err);
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// Startup
+// Startup sequence
 async function start() {
+  await ensureSchema();
   const server = app.listen(PORT, () => logger.info(`Server listening on http://localhost:${PORT}`));
-  // Graceful shutdown
+
   const shutdown = async () => {
     logger.info('Shutting down');
     server.close();
@@ -299,7 +340,6 @@ async function start() {
   process.on('SIGTERM', shutdown);
 }
 
-// Global process-level handlers
 process.on('uncaughtException', (err) => {
   logger.fatal({ err }, 'uncaughtException — exiting');
   process.exit(1);
