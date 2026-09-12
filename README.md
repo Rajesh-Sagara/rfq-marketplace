@@ -62,7 +62,7 @@ This project includes a number of built-in protections. Key points and recommend
 - Parameterized queries: All DB access uses parameterized queries via `pg` to avoid SQL injection.
 - Rate limiting: `express-rate-limit` is enabled to prevent brute-force and abusive traffic. Tune `windowMs` and `max` for your expected usage.
 - Request size limits: `express.json({ limit: '1mb' })` is set. Lower this if you don't accept larger payloads.
-- Security headers: `helmet()` sets common headers; consider adding a strict CSP for the frontend when serving in production.
+- Security headers: `helmet()` is configured to set common headers, including a strict Content Security Policy (CSP) to protect the frontend.
 - TLS: Run behind a TLS-terminating reverse proxy (Cloud load balancer / NGINX) and never expose the service directly over plain HTTP in production.
 - Tokens & cookies: JWTs are short-lived (1h). Consider refresh tokens with rotation/revocation for real production.
 - Secrets: Use a secret manager (AWS Secrets Manager, Azure Key Vault, etc.) in production — do not store secrets in the repo or in container images.
@@ -79,26 +79,9 @@ This project includes a number of built-in protections. Key points and recommend
 - Add process monitoring (systemd, Kubernetes liveness/readiness probes, or a process supervisor) in production.
 
 ## Testing & CI
-- Add unit tests with `jest` and API integration tests with `supertest`.
-- Example GitHub Actions workflow (recommended):
+- API integration tests are implemented using `jest` and `supertest`. Run them via `npm test`.
+- A GitHub Actions workflow is included to automatically run tests on push and pull requests (`.github/workflows/ci.yml`).
 
-```yaml
-name: CI
-on: [push, pull_request]
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      - name: Install deps
-        run: npm ci
-      - name: Run tests
-        run: npm test
-```
 
 ## Database migrations & production readiness
 - Schema creation has been decoupled from app startup. Migrations are managed by `migrate.js` and stored in the `migrations/` directory. Run `npm run migrate` to apply new migrations before starting the application. For enterprise-scale production, you may still consider adopting a more robust migration tool (like `node-pg-migrate`, `knex`, or `Flyway`).
