@@ -27,10 +27,18 @@ Copy-Item example.env .env
 docker compose up -d
 ```
 
-3. Start the app (from the inner `rfq-marketplace` folder):
+3. Install dependencies and run migrations:
 
 ```powershell
-cd rfq-marketplace
+npm install
+npm run migrate
+```
+
+4. Start the app:
+
+```powershell
+npm run dev
+# or
 node server.js
 ```
 
@@ -93,7 +101,7 @@ jobs:
 ```
 
 ## Database migrations & production readiness
-- Currently the server ensures the schema on startup with `CREATE TABLE IF NOT EXISTS`. For production use, adopt a migration tool (`node-pg-migrate`, `knex`, `Flyway`) and run migrations separately from app startup.
+- Schema creation has been decoupled from app startup. Migrations are managed by `migrate.js` and stored in the `migrations/` directory. Run `npm run migrate` to apply new migrations before starting the application. For enterprise-scale production, you may still consider adopting a more robust migration tool (like `node-pg-migrate`, `knex`, or `Flyway`).
 
 ## Deploying (Docker)
 - A `Dockerfile` and `docker-compose.yml` are included for local testing. For production, build an image using the `Dockerfile`, push to a registry, and run in your orchestration platform.
