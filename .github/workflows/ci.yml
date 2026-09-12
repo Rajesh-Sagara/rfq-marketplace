@@ -11,7 +11,7 @@ jobs:
           node-version: '22'
       - name: Install deps
         run: npm ci
-        working-directory: ./rfq-marketplace
+        
       - name: Run tests
         run: npm test
-        working-directory: ./rfq-marketplace
+        
